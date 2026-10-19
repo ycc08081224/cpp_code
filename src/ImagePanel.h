@@ -1,17 +1,19 @@
 #pragma once
 #include "MediaPanel.h"
-#include <QLabel>
-#include <QScrollArea>
-#include <QPixmap>
-#include <QResizeEvent>
+#include <QGraphicsView>
+#include <QGraphicsScene>
+#include <QGraphicsPixmapItem>
+#include <QMovie>
 #include <QSize>
+
+class QLabel;
 
 class ImagePanel : public MediaPanel
 {
     Q_OBJECT
 public:
     explicit ImagePanel(const QString &path, QWidget *parent = nullptr);
-    ~ImagePanel() override = default;
+    ~ImagePanel() override;
 
     void play() override {}
     void pause() override {}
@@ -21,10 +23,25 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
-    QLabel *m_imageLabel = nullptr;
-    QPixmap m_originalPixmap;
-    QSize m_lastRenderSize{-1, -1};
-    void renderImage();
+    void buildZoomBar();
+    void fitToWindow();
+    void actualSize();
+    void applyZoom(qreal factor);
+    void zoomByButton(qreal factor);
+    void updateZoomLabel();
+    void showMessage(const QString &text);
+
+    QGraphicsView *m_view = nullptr;
+    QGraphicsScene *m_scene = nullptr;
+    QGraphicsPixmapItem *m_item = nullptr;
+    QMovie *m_movie = nullptr;
+    QWidget *m_zoomBar = nullptr;
+    QLabel *m_zoomLabel = nullptr;
+    QSize m_lastFrameSize;
+    bool m_fitMode = true;
+    qreal m_zoom = 1.0;
+    bool m_empty = false;
 };

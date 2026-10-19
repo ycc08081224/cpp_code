@@ -8,6 +8,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QActionGroup>
 #include <QFileDialog>
 #include <QStatusBar>
 #include <QSplitter>
@@ -31,6 +32,7 @@
 #include <QMimeData>
 #include <QEvent>
 #include <QCloseEvent>
+#include <QShowEvent>
 #include <QTimer>
 #include <QDebug>
 #include <QElapsedTimer>
@@ -38,6 +40,16 @@
 #include <QStyle>
 #include <QIcon>
 #include <QApplication>
+#include <QCursor>
+#include <QLineEdit>
+#include <QTextEdit>
+#include <QPlainTextEdit>
+#include <QAbstractSpinBox>
+#include <QAbstractButton>
+#include <QAbstractSlider>
+#include <QComboBox>
+#include <QSignalBlocker>
+#include <QStatusBar>
 #include <QSet>
 #include <QList>
 #include <QListWidgetItem>
@@ -57,41 +69,72 @@ MainWindow::MainWindow(QWidget *parent)
     QMenuBar *menuBar = this->menuBar();
 
     QMenu *fileMenu = menuBar->addMenu("文件(&F)");
-    fileMenu->addAction("添加文件...", this, &MainWindow::addFiles, QKeySequence::Open);
-    fileMenu->addAction("添加文件夹...", this, &MainWindow::addFolder);
+    auto *openAct = fileMenu->addAction("添加文件...");
+    openAct->setShortcut(QKeySequence::Open);
+    connect(openAct, &QAction::triggered, this, &MainWindow::addFiles);
+
+    auto *openDirAct = fileMenu->addAction("添加文件夹...");
+    openDirAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O));
+    connect(openDirAct, &QAction::triggered, this, &MainWindow::addFolder);
+
     fileMenu->addSeparator();
     m_recentMenu = fileMenu->addMenu("最近打开(&R)");
     fileMenu->addAction("清除历史", this, &MainWindow::clearRecentFiles);
     fileMenu->addSeparator();
     fileMenu->addAction("全部清除", this, &MainWindow::clearAll);
     fileMenu->addSeparator();
-    fileMenu->addAction("退出", this, &QWidget::close, QKeySequence::Quit);
+    auto *quitAct = fileMenu->addAction("退出");
+    quitAct->setShortcut(QKeySequence::Quit);
+    connect(quitAct, &QAction::triggered, this, &QWidget::close);
 
     QMenu *playMenu = menuBar->addMenu("播放(&P)");
     playMenu->addAction("全部播放", this, &MainWindow::playAll);
     playMenu->addAction("全部暂停", this, &MainWindow::pauseAll);
     playMenu->addAction("全部停止", this, &MainWindow::stopAll);
     playMenu->addSeparator();
-    auto *loopAction = playMenu->addAction("循环播放");
-    loopAction->setCheckable(true);
-    loopAction->setChecked(true);
-    connect(loopAction, &QAction::toggled, this, [this](bool on) {
+    m_loopAction = playMenu->addAction("循环播放");
+    m_loopAction->setCheckable(true);
+    m_loopAction->setChecked(m_loop);
+    connect(m_loopAction, &QAction::toggled, this, [this](bool on) {
         m_loop = on;
         for (auto *pp : m_panels) pp->setLoop(on);
+        if (m_audioPanel) m_audioPanel->setLoop(on);
     });
-    auto *muteAction = playMenu->addAction("全部静音");
-    muteAction->setCheckable(true);
-    muteAction->setChecked(false);
-    connect(muteAction, &QAction::toggled, this, [this](bool on) {
-        for (auto *pp : m_panels) {
-            if (pp->type() == MediaPanel::Video || pp->type() == MediaPanel::Audio)
-                pp->setVolume(on ? 0 : 70);
-        }
-        if (m_audioPanel) m_audioPanel->setVolume(on ? 0 : 70);
+
+    m_muteAllAction = playMenu->addAction(QString::fromUtf8("全部静音"));
+    m_muteAllAction->setCheckable(true);
+    m_muteAllAction->setChecked(false);
+    connect(m_muteAllAction, &QAction::toggled, this, [this](bool on) {
+        applyMuteAll(on);
     });
+
+    playMenu->addSeparator();
+    QMenu *speedMenu = playMenu->addMenu("播放速度");
+    static const struct { const char *label; qreal rate; } kRates[] = {
+        { "0.5x", 0.5 }, { "0.75x", 0.75 }, { "1.0x", 1.0 },
+        { "1.25x", 1.25 }, { "1.5x", 1.5 }, { "2.0x", 2.0 }
+    };
+    auto *speedGroup = new QActionGroup(this);
+    speedGroup->setExclusive(true);
+    for (const auto &r : kRates) {
+        QAction *act = speedMenu->addAction(QString::fromUtf8(r.label));
+        act->setCheckable(true);
+        act->setChecked(qFuzzyCompare(r.rate, 1.0));
+        act->setData(r.rate);
+        speedGroup->addAction(act);
+        connect(act, &QAction::triggered, this, [this, rate = r.rate]() { applyPlaybackRate(rate); });
+    }
+    m_speedGroup = speedGroup;
 
     QMenu *viewMenu = menuBar->addMenu("视图(&V)");
     viewMenu->addAction("全屏模式", this, &MainWindow::toggleFullScreen, QKeySequence(Qt::Key_F11));
+    viewMenu->addAction("显示/隐藏播放列表", this, &MainWindow::togglePlaylist, QKeySequence(Qt::CTRL | Qt::Key_L));
+    viewMenu->addAction("还原面板尺寸", this, &MainWindow::resetAmplify, QKeySequence(Qt::CTRL | Qt::Key_0));
+    viewMenu->addSeparator();
+    m_statusAction = viewMenu->addAction("显示状态栏");
+    m_statusAction->setCheckable(true);
+    m_statusAction->setChecked(true);
+    connect(m_statusAction, &QAction::toggled, this, &MainWindow::toggleStatusBar);
 
     QMenu *helpMenu = menuBar->addMenu("帮助(&H)");
     helpMenu->addAction("使用说明", this, &MainWindow::showHelp, QKeySequence::HelpContents);
@@ -124,7 +167,35 @@ MainWindow::MainWindow(QWidget *parent)
     root->setSpacing(0);
     root->addWidget(m_innerSplitter);
 
-    statusBar()->showMessage("就绪 | Click \xe2\x9b\xb6 to resize | Min 1/24");
+    // 之前这里直接 hide()，导致全程序所有 showMessage 提示（加载成功/截断/已达上限…）
+    // 用户一条都看不到。改成深色主题常驻，并在视图菜单里保留开关。
+    statusBar()->setStyleSheet(
+        "QStatusBar { background: #1c1c32; color: #a8a8d0; font-size: 12px;"
+        "             border-top: 1px solid #2a2a44; padding-left: 6px; }"
+        "QStatusBar::item { border: none; }"
+    );
+    statusBar()->setSizeGripEnabled(false);
+    statusBar()->showMessage(QString::fromUtf8("就绪 · 拖入文件或按 Ctrl+O 添加 · F1 查看帮助"));
+
+    // 临时提示（2~3 秒）过期后回到常驻文案，否则状态栏会变成一条空白带
+    connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString &msg) {
+        if (!msg.isEmpty()) return;
+        QTimer::singleShot(0, this, [this]() {
+            if (statusBar()->currentMessage().isEmpty())
+                statusBar()->showMessage(QString::fromUtf8("就绪 · 拖入文件或按 Ctrl+O 添加 · F1 查看帮助"));
+        });
+    });
+
+    // Ctrl+1~9 直接设定放大比例（0=原始 1=1/4 2=1/3 3=1/2）
+    for (int i = 1; i <= 9; ++i) {
+        auto *sc = new QShortcut(QKeySequence(Qt::CTRL | static_cast<Qt::Key>(Qt::Key_0 + i)), this);
+        connect(sc, &QShortcut::activated, this, [this, i]() { setAmplifyLevel(i); });
+    }
+    auto *closeSc = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_W), this);
+    connect(closeSc, &QShortcut::activated, this, &MainWindow::closePanelUnderCursor);
+
+    auto *audioSc = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_M), this);
+    connect(audioSc, &QShortcut::activated, this, &MainWindow::toggleAudio);
 
     if (QScreen *screen = QGuiApplication::primaryScreen()) {
         QRect screenRect = screen->availableGeometry();
@@ -183,18 +254,18 @@ void MainWindow::addPanel(const QString &path)
                 m_audioPanel->stop();
                 m_audioPanel->deleteLater();
                 m_audioPanel = nullptr;
+                m_audioPath.clear();
             }
         });
         connect(panel, &MediaPanel::playlistToggleClicked, this, &MainWindow::togglePlaylist);
+        connect(panel, &MediaPanel::muteToggled, this, &MainWindow::onPanelMuteChanged);
         m_audioPanel = panel;
+        m_audioPath = QFileInfo(path).absoluteFilePath();
         panel->setLoop(m_loop);
+        panel->setPlaybackRate(m_rate);
+        panel->setMuted(m_muteAll);
         panel->adjustSize();
-        QRect cr = m_container->rect();
-        int pw = panel->width();
-        int ph = panel->height();
-        int x = cr.left() + (cr.width() - pw) / 2;
-        int y = cr.bottom() - ph - 10;
-        panel->move(x, y);
+        layoutAudioPanel();
         panel->show();
         panel->raise();
         statusBar()->showMessage(QString("已加载音频: %1 (Ctrl+M 切换)").arg(QFileInfo(path).fileName()), 3000);
@@ -216,7 +287,10 @@ void MainWindow::addPanel(const QString &path)
     connect(panel, &MediaPanel::closed, this, &MainWindow::onPanelClosed);
     connect(panel, &MediaPanel::amplifyClicked, this, &MainWindow::onPanelAmplified);
     connect(panel, &MediaPanel::playlistToggleClicked, this, &MainWindow::togglePlaylist);
+    connect(panel, &MediaPanel::muteToggled, this, &MainWindow::onPanelMuteChanged);
     panel->setLoop(m_loop);
+    panel->setPlaybackRate(m_rate);
+    panel->setMuted(m_muteAll);
     m_panels.append(panel);
     m_ampLevels.append(0);
     relayout();
@@ -364,10 +438,10 @@ void MainWindow::onPanelClosed(MediaPanel *panel)
     panel->setParent(nullptr);
     qDebug() << "[Close] detach:" << t.elapsed() << "ms";
 
-    if (!m_panels.isEmpty()) {
-        relayout();
-        qDebug() << "[Close] relayout:" << t.elapsed() << "ms";
-    }
+    // 即使关掉的是最后一个面板也要 relayout：detachPanels 会销毁残留的空列 splitter，
+    // 否则 N 次关闭后窗口里会堆一排空的拖拽条
+    relayout();
+    qDebug() << "[Close] relayout:" << t.elapsed() << "ms";
 
     panel->deleteLater();
     qDebug() << "[Close] deleteLater:" << t.elapsed() << "ms";
@@ -419,26 +493,177 @@ void MainWindow::addFolder()
 
 void MainWindow::clearAll()
 {
-    for (auto *p : m_panels) p->deleteLater();
+    if (m_panels.isEmpty() && !m_audioPanel) return;
+
+    // 误点一次就把十几个面板全清掉太狠，先确认
+    if (!m_panels.isEmpty()) {
+        auto ret = QMessageBox::question(this, QString::fromUtf8("全部清除"),
+            QString::fromUtf8("确定关闭全部 %1 个面板吗？").arg(m_panels.size()),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (ret != QMessageBox::Yes) return;
+    }
+
+    for (auto *p : m_panels) {
+        p->stop();
+        savePanelProgress(p);
+        p->setParent(nullptr);
+        p->deleteLater();
+    }
     m_panels.clear();
     m_ampLevels.clear();
+
     if (m_audioPanel) {
-        m_audioPanel->close();
+        m_audioPanel->stop();
+        m_audioPanel->hide();
         m_audioPanel->deleteLater();
         m_audioPanel = nullptr;
+        m_audioPath.clear();
     }
+
     detachPanels();
+    statusBar()->showMessage(QString::fromUtf8("已清空全部面板"), 2000);
 }
 
-void MainWindow::playAll()  { for (auto *p : m_panels) if (!p->isPlaying()) p->play(); if (m_audioPanel) m_audioPanel->play(); }
+void MainWindow::playAll()
+{
+    // 静音状态完全归各面板自己管：这里只负责播放，
+    // 既不搞「第一个视频有声、其余静音」，也不把某个面板的静音状态同步给别人
+    for (auto *p : m_panels) {
+        if (!p->isPlaying()) p->play();
+    }
+    if (m_audioPanel) m_audioPanel->play();
+}
+
+void MainWindow::onPanelMuteChanged()
+{
+    // 单面板的静音按钮只影响自己，这里仅把菜单「全部静音」的勾选状态跟实际情况对齐
+    bool allMuted = true;
+    bool any = false;
+
+    for (auto *p : m_panels) {
+        if (p->type() == MediaPanel::Video || p->type() == MediaPanel::Audio) {
+            any = true;
+            if (!p->isMuted()) { allMuted = false; break; }
+        }
+    }
+    if (allMuted && m_audioPanel) {
+        any = true;
+        if (!m_audioPanel->isMuted()) allMuted = false;
+    }
+
+    m_muteAll = any && allMuted;
+    if (m_muteAllAction) {
+        QSignalBlocker blocker(m_muteAllAction);
+        m_muteAllAction->setChecked(m_muteAll);
+        m_muteAllAction->setText(m_muteAll ? QString::fromUtf8("取消全部静音")
+                                           : QString::fromUtf8("全部静音"));
+    }
+}
+
+void MainWindow::applyMuteAll(bool muted)
+{
+    m_muteAll = muted;
+
+    for (auto *p : m_panels) {
+        if (p->type() == MediaPanel::Video || p->type() == MediaPanel::Audio)
+            p->setMuted(muted);
+    }
+    if (m_audioPanel) m_audioPanel->setMuted(muted);
+
+    // 菜单勾选/文字与实际静音状态保持一致（此处回写 setChecked 会再次触发 toggled）
+    if (m_muteAllAction) {
+        QSignalBlocker blocker(m_muteAllAction);
+        m_muteAllAction->setChecked(muted);
+        m_muteAllAction->setText(muted ? QString::fromUtf8("取消全部静音")
+                                       : QString::fromUtf8("全部静音"));
+    }
+}
 void MainWindow::pauseAll() { for (auto *p : m_panels) if (p->isPlaying())  p->pause(); if (m_audioPanel) m_audioPanel->pause(); }
 void MainWindow::stopAll()  { for (auto *p : m_panels) p->stop(); if (m_audioPanel) m_audioPanel->stop(); }
 
 void MainWindow::toggleAudio()
 {
-    if (m_audioPanel) {
-        m_audioPanel->toggleVisible();
+    if (!m_audioPanel) {
+        statusBar()->showMessage(QString::fromUtf8("当前没有音频面板（拖入 mp3 / wav / flac 等音频文件即可）"), 2500);
+        return;
     }
+    m_audioPanel->toggleVisible();
+}
+
+void MainWindow::layoutAudioPanel()
+{
+    if (m_audioPanel) m_audioPanel->anchorToParent();
+}
+
+MediaPanel *MainWindow::panelUnderCursor() const
+{
+    QWidget *w = QApplication::widgetAt(QCursor::pos());
+    while (w) {
+        if (auto *mp = qobject_cast<MediaPanel*>(w)) return mp;
+        w = w->parentWidget();
+    }
+    return nullptr;
+}
+
+MediaPanel *MainWindow::activePanel() const
+{
+    return m_panels.isEmpty() ? nullptr : m_panels.last();
+}
+
+void MainWindow::setAmplifyLevel(int level)
+{
+    if (m_panels.isEmpty()) return;
+    MediaPanel *target = panelUnderCursor();
+    if (!target) target = activePanel();
+
+    const int idx = m_panels.indexOf(target);
+    if (idx < 0) return;
+
+    m_ampLevels[idx] = qBound(0, level, AMP_LEVELS - 1);
+    relayout();
+
+    static const char *labels[] = { "原始", "1/4", "1/3", "1/2" };
+    statusBar()->showMessage(QString::fromUtf8("尺寸: %1").arg(QString::fromUtf8(labels[m_ampLevels[idx]])), 1500);
+}
+
+void MainWindow::resetAmplify()
+{
+    bool changed = false;
+    for (int i = 0; i < m_ampLevels.size(); ++i) {
+        if (m_ampLevels[i] != 0) { m_ampLevels[i] = 0; changed = true; }
+    }
+    if (changed) relayout();
+    statusBar()->showMessage(QString::fromUtf8("已还原为原始尺寸"), 1500);
+}
+
+void MainWindow::closePanelUnderCursor()
+{
+    // 只关鼠标指着的那一个，避免误关最后一个面板
+    MediaPanel *target = panelUnderCursor();
+    if (target) {
+        target->requestClose();
+        return;
+    }
+    if (m_audioPanel && m_audioPanel->geometry().contains(
+            m_audioPanel->mapFromGlobal(QCursor::pos()))) {
+        m_audioPanel->requestClose();
+        return;
+    }
+    statusBar()->showMessage(QString::fromUtf8("请把鼠标移到要关闭的面板上再按 Ctrl+W"), 2000);
+}
+
+void MainWindow::applyPlaybackRate(qreal rate)
+{
+    m_rate = rate;
+    for (auto *p : m_panels) p->setPlaybackRate(rate);
+    if (m_audioPanel) m_audioPanel->setPlaybackRate(rate);
+    statusBar()->showMessage(QString::fromUtf8("播放速度: %1x").arg(rate), 1500);
+}
+
+void MainWindow::toggleStatusBar()
+{
+    const bool on = m_statusAction ? m_statusAction->isChecked() : true;
+    statusBar()->setVisible(on);
 }
 
 void MainWindow::toggleFullScreen()
@@ -471,29 +696,97 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
-    QWidget *w = qobject_cast<QWidget*>(watched);
-    if (!w) return QMainWindow::eventFilter(watched, event);
+    const QEvent::Type t = event->type();
 
-    QEvent::Type t = event->type();
-    if (t == QEvent::DragEnter) {
-        QDragEnterEvent *de = static_cast<QDragEnterEvent*>(event);
-        dragEnterEvent(de);
-        return true;
+    // ---- 音频悬浮条跟随主窗口与容器尺寸变化 ----
+    if ((watched == this || watched == m_container) && (t == QEvent::Resize || t == QEvent::Move)) {
+        if (m_audioPanel && m_audioPanel->isVisible())
+            QTimer::singleShot(0, this, [this]() { layoutAudioPanel(); });
+        return QMainWindow::eventFilter(watched, event);
     }
-    if (t == QEvent::DragMove) {
-        QDragMoveEvent *de = static_cast<QDragMoveEvent*>(event);
-        if (de->mimeData()->hasUrls()) {
-            for (const QUrl &url : de->mimeData()->urls()) {
-                if (url.isLocalFile()) { de->acceptProposedAction(); return true; }
+
+    // ---- 键盘：Space / ←→ / Esc ----
+    if (t == QEvent::KeyPress) {
+        auto *ke = static_cast<QKeyEvent*>(event);
+        if (ke->key() == Qt::Key_Escape && m_isFullScreen) {
+            toggleFullScreen();
+            return true;
+        }
+
+        QWidget *focus = QApplication::focusWidget();
+        // 文本输入 / 可键盘激活的控件下不要抢 Space（否则按钮、下拉框按不动）
+        const bool ownKeys = qobject_cast<QLineEdit*>(focus)
+                          || qobject_cast<QTextEdit*>(focus)
+                          || qobject_cast<QPlainTextEdit*>(focus)
+                          || qobject_cast<QAbstractSpinBox*>(focus)
+                          || qobject_cast<QAbstractButton*>(focus)
+                          || qobject_cast<QAbstractSlider*>(focus)
+                          || qobject_cast<QComboBox*>(focus);
+
+        if (!ownKeys && ke->modifiers() == Qt::NoModifier) {
+            MediaPanel *target = panelUnderCursor();
+            if (!target) target = activePanel();
+
+            if (ke->key() == Qt::Key_Space) {
+                if (target) {
+                    target->isPlaying() ? target->pause() : target->play();
+                    return true;
+                }
+                if (m_audioPanel) {
+                    m_audioPanel->isPlaying() ? m_audioPanel->pause() : m_audioPanel->play();
+                    return true;
+                }
+            }
+            if (target && target->duration() > 0 && ke->key() == Qt::Key_Left) {
+                target->seek(qMax<qint64>(0, target->position() - 5000));
+                return true;
+            }
+            if (target && target->duration() > 0 && ke->key() == Qt::Key_Right) {
+                target->seek(qMin(target->duration(), target->position() + 5000));
+                return true;
             }
         }
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    // ---- 拖放：只接管「本地文件」，其余放行 ----
+    // 原来是全局无条件 return true，连文本编辑器拖入文字、文件对话框内拖拽都被吞掉
+    if (t == QEvent::DragEnter || t == QEvent::DragMove || t == QEvent::Drop) {
+        QWidget *w = qobject_cast<QWidget*>(watched);
+        if (!w) return QMainWindow::eventFilter(watched, event);
+
+        const bool inMainArea = (w == this || w == m_container
+                                 || (m_container && m_container->isAncestorOf(w)));
+        if (!inMainArea) return QMainWindow::eventFilter(watched, event);
+
+        // 文本编辑控件自己处理自己的拖放（拖入纯文本）
+        if (qobject_cast<QPlainTextEdit*>(w) || qobject_cast<QTextEdit*>(w) || qobject_cast<QLineEdit*>(w))
+            return QMainWindow::eventFilter(watched, event);
+
+        if (t == QEvent::Drop) {
+            auto *de = static_cast<QDropEvent*>(event);
+            if (de->mimeData() && de->mimeData()->hasUrls()) {
+                dropEvent(de);
+                return true;
+            }
+            return QMainWindow::eventFilter(watched, event);
+        }
+
+        auto *de = static_cast<QDragMoveEvent*>(event);
+        if (!de->mimeData() || !de->mimeData()->hasUrls())
+            return QMainWindow::eventFilter(watched, event);
+
+        bool local = false;
+        for (const QUrl &url : de->mimeData()->urls()) {
+            if (url.isLocalFile()) { local = true; break; }
+        }
+        if (!local) return QMainWindow::eventFilter(watched, event);
+
+        if (t == QEvent::DragEnter) dragEnterEvent(static_cast<QDragEnterEvent*>(event));
+        de->acceptProposedAction();
         return true;
     }
-    if (t == QEvent::Drop) {
-        QDropEvent *de = static_cast<QDropEvent*>(event);
-        dropEvent(de);
-        return true;
-    }
+
     return QMainWindow::eventFilter(watched, event);
 }
 
@@ -549,7 +842,7 @@ void MainWindow::showHelp()
         "</ul>"
         "<h3>&#128221; 基本操作</h3>"
         "<ul>"
-        "<li><b>添加文件</b>: 菜单 [文件 &rarr; 添加文件] (Ctrl+O) 或从资源管理器直接拖入窗口</li>"
+        "<li><b>添加文件</b>: 菜单 [文件 &rarr; 添加文件] 或从资源管理器直接拖入窗口</li>"
         "<li><b>添加文件夹</b>: 菜单 [文件 &rarr; 添加文件夹]，自动加载文件夹内所有支持的文件</li>"
         "<li><b>最近打开</b>: 菜单 [文件 &rarr; 最近打开]，快速加载之前播放过的文件（最多 20 条）</li>"
         "<li><b>清除历史</b>: 菜单 [文件 &rarr; 清除历史]，一键清空历史记录</li>"
@@ -563,22 +856,36 @@ void MainWindow::showHelp()
         "<h3>&#8987; 快捷键</h3>"
         "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;'>"
         "<tr><th>快捷键</th><th>功能</th></tr>"
-        "<tr><td><b>F11</b></td><td>全屏 / 退出全屏</td></tr>"
-        "<tr><td><b>F1</b></td><td>打开本帮助</td></tr>"
         "<tr><td><b>Ctrl + O</b></td><td>添加文件</td></tr>"
         "<tr><td><b>Ctrl + Shift + O</b></td><td>添加文件夹</td></tr>"
+        "<tr><td><b>Space</b></td><td>播放 / 暂停鼠标所在面板</td></tr>"
+        "<tr><td><b>&larr; / &rarr;</b></td><td>后退 / 前进 5 秒</td></tr>"
+        "<tr><td><b>Ctrl + 1 ~ 9</b></td><td>切换鼠标所在面板的放大比例</td></tr>"
+        "<tr><td><b>Ctrl + 0</b></td><td>还原全部面板尺寸</td></tr>"
+        "<tr><td><b>Ctrl + W</b></td><td>关闭鼠标所在面板</td></tr>"
+        "<tr><td><b>Ctrl + L</b></td><td>显示 / 隐藏播放列表</td></tr>"
+        "<tr><td><b>Ctrl + M</b></td><td>显示 / 隐藏音频悬浮窗</td></tr>"
+        "<tr><td><b>Ctrl + S</b></td><td>文本面板保存（Ctrl+Shift+S 另存为）</td></tr>"
+        "<tr><td><b>F11 / Esc</b></td><td>全屏 / 退出全屏</td></tr>"
+        "<tr><td><b>F1</b></td><td>打开本帮助</td></tr>"
         "<tr><td><b>Ctrl + Q</b></td><td>退出程序</td></tr>"
-        "<tr><td><b>Space</b></td><td>播放 / 暂停当前面板</td></tr>"
-        "<tr><td><b>Ctrl + 1 ~ 9</b></td><td>切换第 N 个面板的放大模式</td></tr>"
-        "<tr><td><b>Ctrl + M</b></td><td>切换音频悬浮窗</td></tr>"
         "</table>"
         "<h3>&#128161; 小贴士</h3>"
         "<ul>"
-        "<li>最多同时加载 12 个媒体面板</li>"
+        "<li>最多同时加载 12 个媒体面板，支持视频/音频/图片/PDF/文本混合播放</li>"
         "<li>关闭面板时会自动保存播放进度，下次打开同一文件时恢复</li>"
-        "<li>鼠标在视频画面上静止 2.5 秒后，顶部标题栏和底部控制条会自动隐藏</li>"
+        "<li>鼠标移入视频/音频面板时，标题栏和底部控制条自动显示；移出则自动隐藏</li>"
+        "<li>图片、PDF、文本面板的控制条始终可见，随时能关闭或放大</li>"
+        "<li>图片面板底部有 <b>− 缩小 / 百分比 / + 放大 / 适应窗口 / 原始大小</b>，也支持鼠标滚轮缩放、"
+        "按住拖动平移、双击还原到适应窗口；GIF 会播放动画</li>"
+        "<li>PDF 面板支持翻页、A+/A- 缩放和「适合宽度 / 整页」切换</li>"
+        "<li>Word / PPT 文件在后台提取文本，不会再让界面卡死；保存 docx 需要本机装有 Word 或 WPS</li>"
+        "<li>音量条常驻在底部控制栏，可直接拖动；在音量图标上滚动滚轮也能调</li>"
+        "<li>同时播放多个视频时，仅第一个有声音，其余自动静音以避免音频混乱；"
+        "想让所有视频都出声，用 [播放 → 全部静音] 勾选一次再取消即可</li>"
+        "<li>播放菜单里可以把速度调到 0.5x ~ 2.0x，新打开的面板会继承该速度</li>"
         "<li>按 F11 进入全屏获得最大播放区域</li>"
-        "<li>面板自动网格布局，文件越多排列越紧密</li>"
+        "<li>支持从资源管理器直接拖拽文件或文件夹到窗口添加</li>"
         "</ul>";
 
         QDialog dlg(this);
@@ -610,20 +917,76 @@ void MainWindow::showAbout()
 {
     QMessageBox::about(this, "关于全能媒体播放器",
         "<h2 style='text-align:center;'>全能媒体播放器</h2>"
-        "<p style='text-align:center; font-size:14px;'>版本 1.1.0</p>"
+        "<p style='text-align:center; font-size:14px;'>版本 1.2.1</p>"
         "<hr>"
         "<p>一个支持同时播放多种媒体的播放器，</p>"
         "<p>支持视频、音频、图片、PDF 和文本文件。</p>"
-        "<p><br>本次更新新增：<br>"
-        "&nbsp;&nbsp;&bull; 最近打开历史记录<br>"
-        "&nbsp;&nbsp;&bull; 大幅降低鼠标移动卡顿<br>"
-        "&nbsp;&nbsp;&bull; 修复关闭面板闪退问题<br>"
-        "&nbsp;&nbsp;&bull; 高性能图片渲染</p>"
+        "<p><br>本次更新：<br>"
+        "&nbsp;&nbsp;&bull; 音量条改为控制栏内联滑条，悬停/拖动都能用（原浮动面板被视频原生窗口遮挡）<br>"
+        "&nbsp;&nbsp;&bull; 修复「取消全部静音」救不回被自动静音的视频<br>"
+        "&nbsp;&nbsp;&bull; 修复图片 / PDF / 文本面板控制条永久隐藏、无法关闭的问题<br>"
+        "&nbsp;&nbsp;&bull; 重做自动隐藏：播放中静止 2.5 秒才收起，暂停常驻<br>"
+        "&nbsp;&nbsp;&bull; 修复音频面板播完不循环、不跟随主窗口、静音图标错乱<br>"
+        "&nbsp;&nbsp;&bull; 修复拖动进度条时滑块回弹、视频循环失效<br>"
+        "&nbsp;&nbsp;&bull; 实装 Ctrl+O / Ctrl+Shift+O / Space / ←→ / Ctrl+1~9 / Ctrl+W 等快捷键<br>"
+        "&nbsp;&nbsp;&bull; 图片面板支持滚轮缩放、拖拽平移、GIF 动画<br>"
+        "&nbsp;&nbsp;&bull; Word / PPT 文本改为后台异步提取，不再卡死界面<br>"
+        "&nbsp;&nbsp;&bull; 新增 0.5x ~ 2.0x 倍速播放<br>"
+        "&nbsp;&nbsp;&bull; 修复窗口位置/大小、音频面板、循环与倍速设置的持久化</p>"
         "<p style='color:#888; font-size:12px; margin-top:20px;'>基于 Qt 6.7 开发</p>");
+}
+
+void MainWindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+    if (m_geometryClamped) return;
+    m_geometryClamped = true;
+
+    // restoreGeometry 不会校正越界：换显示器 / 改分辨率 / 任务栏变化后，
+    // 上一次保存的几何可能让窗口底部藏到任务栏后面（状态栏就看不见了）
+    if (m_isFullScreen || isMaximized()) return;
+    QScreen *scr = screen() ? screen() : QGuiApplication::primaryScreen();
+    if (!scr) return;
+
+    const QRect avail = scr->availableGeometry();
+
+    // 注意：要按「外框」而不是客户区来限制，否则标题栏会顶到屏幕外、
+    // 客户区底部会压到任务栏底下（状态栏正好被挡住）
+    QRect frame = frameGeometry();
+    const int dw = qMax(0, frame.width()  - width());
+    const int dh = qMax(0, frame.height() - height());
+
+    QSize target = size();
+    target.setWidth(qMin(target.width(),  qMax(200, avail.width()  - dw)));
+    target.setHeight(qMin(target.height(), qMax(200, avail.height() - dh)));
+    if (target != size()) resize(target);
+
+    frame = frameGeometry();
+    const int dx = frame.left() - geometry().left();
+    const int dy = frame.top()  - geometry().top();
+
+    QPoint p = frame.topLeft();
+    const int maxX = avail.right()  - frame.width()  + 1;
+    const int maxY = avail.bottom() - frame.height() + 1;
+    p.setX(qBound(avail.left(), p.x(), qMax(avail.left(), maxX)));
+    p.setY(qBound(avail.top(),  p.y(), qMax(avail.top(),  maxY)));
+    if (p != frame.topLeft()) move(p.x() - dx, p.y() - dy);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // 退出前先处理未保存的文本面板（原来直接关，改过的内容全丢）
+    const QVector<MediaPanel*> snapshot = m_panels;
+    for (MediaPanel *p : snapshot) {
+        auto *tp = qobject_cast<TextPanel*>(p);
+        if (!tp || !tp->hasUnsavedChanges()) continue;
+        tp->requestClose();
+        if (m_panels.contains(p)) {   // 用户点了「取消」
+            event->ignore();
+            return;
+        }
+    }
+
     saveSettings();
     QMainWindow::closeEvent(event);
 }
@@ -640,6 +1003,7 @@ void MainWindow::saveSettings()
 
     s.beginGroup("preferences");
     s.setValue("loop", m_loop);
+    s.setValue("rate", m_rate);
     s.endGroup();
 
     QStringList paths;
@@ -661,9 +1025,9 @@ void MainWindow::saveSettings()
         s.setValue("recentFiles", recent);
     }
 
-    if (m_audioPanel) {
-        s.setValue("audio/visible", m_audioPanel->isVisible());
-    }
+    // 音频面板不占用 m_panels，单独保存路径，否则重开程序音频会彻底丢失
+    s.setValue("audio/path", m_audioPath);
+    s.setValue("audio/visible", m_audioPanel && m_audioPanel->isVisible());
 }
 
 void MainWindow::loadSettings()
@@ -680,6 +1044,8 @@ void MainWindow::loadSettings()
 
     s.beginGroup("preferences");
     m_loop = s.value("loop", true).toBool();
+    m_rate = s.value("rate", 1.0).toDouble();
+    if (m_rate < 0.1 || m_rate > 8.0) m_rate = 1.0;
     s.endGroup();
 
     QStringList paths = s.value("files/lastFiles").toStringList();
@@ -707,9 +1073,37 @@ void MainWindow::loadSettings()
     }
 
     s.beginGroup("audio");
-    if (s.value("visible", false).toBool() && m_audioPanel)
-        m_audioPanel->show();
+    const QString audioPath = s.value("path").toString();
+    const bool audioVisible = s.value("visible", false).toBool();
     s.endGroup();
+
+    if (!audioPath.isEmpty() && QFileInfo::exists(audioPath)) {
+        addPanel(audioPath);
+        if (m_audioPanel) {
+            m_audioPanel->setVisible(audioVisible);
+            if (audioVisible) { layoutAudioPanel(); m_audioPanel->raise(); }
+        }
+    }
+
+    // 让菜单勾选状态和实际设置一致（原来只读了 m_loop，菜单里永远是勾选 1.0x / 循环）
+    if (m_loopAction) {
+        QSignalBlocker blocker(m_loopAction);
+        m_loopAction->setChecked(m_loop);
+    }
+    if (m_speedGroup) {
+        for (QAction *a : m_speedGroup->actions())
+            a->setChecked(qFuzzyCompare(a->data().toDouble(), m_rate));
+    }
+    for (auto *p : m_panels) {
+        p->setLoop(m_loop);
+        p->setPlaybackRate(m_rate);
+    }
+    if (m_audioPanel) {
+        m_audioPanel->setLoop(m_loop);
+        m_audioPanel->setPlaybackRate(m_rate);
+    }
+
+    if (m_isFullScreen) showFullScreen();
 }
 
 void MainWindow::savePanelProgress(MediaPanel *panel)

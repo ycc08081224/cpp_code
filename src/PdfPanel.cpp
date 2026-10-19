@@ -12,11 +12,8 @@
 PdfPanel::PdfPanel(const QString &path, QWidget *parent)
     : MediaPanel(Pdf, path, parent)
 {
-    m_progress->setVisible(false);
-    m_timeLabel->setVisible(false);
-    m_volume->setVisible(false);
-    m_playBtn->setVisible(false);
-    m_stopBtn->setVisible(false);
+    // PDF 没有播放/进度/音量，翻页和缩放工具栏在媒体区内部，底部控制栏直接移除
+    removeControlBar();
 
     QVBoxLayout *outer = new QVBoxLayout(m_mediaArea);
     outer->setContentsMargins(0, 0, 0, 0);
@@ -41,14 +38,21 @@ PdfPanel::PdfPanel(const QString &path, QWidget *parent)
         toolbar->setSpacing(4);
         toolbar->addStretch();
 
-        m_firstPageBtn = new QPushButton("\xe2\x8f\xaa", m_mediaArea);
-        m_prevPageBtn  = new QPushButton("\xe2\x97\x80", m_mediaArea);
-        m_nextPageBtn  = new QPushButton("\xe2\x96\xb6", m_mediaArea);
-        m_lastPageBtn  = new QPushButton("\xe2\x8f\xab", m_mediaArea);
+        // 用 ASCII 而不是 ⏪◀▶⏩：默认字体里这些符号常常缺字形，渲染成方块
+        m_firstPageBtn = new QPushButton("|<", m_mediaArea);
+        m_prevPageBtn  = new QPushButton("<",  m_mediaArea);
+        m_nextPageBtn  = new QPushButton(">",  m_mediaArea);
+        m_lastPageBtn  = new QPushButton(">|", m_mediaArea);
+        m_firstPageBtn->setToolTip(QString::fromUtf8("第一页"));
+        m_prevPageBtn->setToolTip(QString::fromUtf8("上一页"));
+        m_nextPageBtn->setToolTip(QString::fromUtf8("下一页"));
+        m_lastPageBtn->setToolTip(QString::fromUtf8("最后一页"));
         m_zoomOutBtn   = new QPushButton("A-", m_mediaArea);
         m_zoomInBtn    = new QPushButton("A+", m_mediaArea);
+        m_fitBtn       = new QPushButton(QString::fromUtf8("适合"), m_mediaArea);
+        m_fitBtn->setToolTip(QString::fromUtf8("在「适合宽度 / 适合整页」之间切换"));
 
-        for (auto *b : {m_firstPageBtn, m_prevPageBtn, m_nextPageBtn, m_lastPageBtn, m_zoomOutBtn, m_zoomInBtn}) {
+        for (auto *b : {m_firstPageBtn, m_prevPageBtn, m_nextPageBtn, m_lastPageBtn, m_zoomOutBtn, m_zoomInBtn, m_fitBtn}) {
             b->setFixedHeight(22);
             b->setStyleSheet(
                 "QPushButton { background: #3a3a55; color: #ddd; border: 1px solid #555; border-radius: 3px; padding: 0 8px; font-size: 11px; }"
@@ -68,6 +72,7 @@ PdfPanel::PdfPanel(const QString &path, QWidget *parent)
         toolbar->addSpacing(12);
         toolbar->addWidget(m_zoomOutBtn);
         toolbar->addWidget(m_zoomInBtn);
+        toolbar->addWidget(m_fitBtn);
         toolbar->addStretch();
 
         outer->addLayout(toolbar);
@@ -78,6 +83,7 @@ PdfPanel::PdfPanel(const QString &path, QWidget *parent)
         connect(m_lastPageBtn,  &QPushButton::clicked, this, &PdfPanel::onLastPage);
         connect(m_zoomInBtn,    &QPushButton::clicked, this, &PdfPanel::onZoomIn);
         connect(m_zoomOutBtn,   &QPushButton::clicked, this, &PdfPanel::onZoomOut);
+        connect(m_fitBtn,       &QPushButton::clicked, this, &PdfPanel::onToggleFit);
 
         if (auto *nav = m_pdfView->pageNavigator()) {
             connect(nav, &QPdfPageNavigator::currentPageChanged,
@@ -154,6 +160,20 @@ void PdfPanel::onZoomOut()
         qreal z = m_pdfView->zoomFactor();
         m_pdfView->setZoomMode(QPdfView::ZoomMode::Custom);
         m_pdfView->setZoomFactor(qMax(z / 1.25, 0.1));
+    }
+#endif
+}
+
+void PdfPanel::onToggleFit()
+{
+#ifdef HAS_QTPDF
+    if (!m_pdfView) return;
+    if (m_pdfView->zoomMode() == QPdfView::ZoomMode::FitToWidth) {
+        m_pdfView->setZoomMode(QPdfView::ZoomMode::FitInView);
+        if (m_fitBtn) m_fitBtn->setText(QString::fromUtf8("整页"));
+    } else {
+        m_pdfView->setZoomMode(QPdfView::ZoomMode::FitToWidth);
+        if (m_fitBtn) m_fitBtn->setText(QString::fromUtf8("适合"));
     }
 #endif
 }

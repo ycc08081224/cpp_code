@@ -5,92 +5,55 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QTextStream>
+#include <QStringDecoder>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QShortcut>
 #include <QKeySequence>
 #include <QProcess>
+#include <QTimer>
+#include <QUuid>
 #include <QDateTime>
 
-static void debugLog(const QString &msg)
-{
-    QString logPath = QDir::tempPath() + "/mmplayer_debug.log";
-    QFile log(logPath);
-    if (log.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-        QTextStream ls(&log);
-        ls << QDateTime::currentDateTime().toString("HH:mm:ss.zzz") << " | " << msg << "\n";
-        log.close();
-    }
-}
+static const qint64 kBigFileWarnBytes = 8LL * 1024 * 1024;   // 8MB
+static const qint64 kHugeFileBytes    = 64LL * 1024 * 1024;  // 64MB 直接拒绝
 
 static bool isWordFormat(const QString &path)
 {
-    QString lower = path.toLower();
-    bool r = lower.endsWith(".doc") || lower.endsWith(".docx") || lower.endsWith(".rtf");
-    debugLog(QString("isWordFormat(%1) = %2").arg(path).arg(r));
-    return r;
+    const QString lower = path.toLower();
+    return lower.endsWith(".doc") || lower.endsWith(".docx") || lower.endsWith(".rtf");
 }
 
 static bool isPptFormat(const QString &path)
 {
-    QString lower = path.toLower();
-    bool r = lower.endsWith(".ppt") || lower.endsWith(".pptx")
+    const QString lower = path.toLower();
+    return lower.endsWith(".ppt") || lower.endsWith(".pptx")
         || lower.endsWith(".pptm") || lower.endsWith(".ppsm");
-    debugLog(QString("isPptFormat(%1) = %2").arg(path).arg(r));
-    return r;
 }
 
-static QString writePs1(const QString &scriptBody)
+static QString psQuote(const QString &s)
 {
-    QString ps1Path = QDir::tempPath() + "/mmplayer_office_helper.ps1";
+    // PowerShell 单引号字符串：内部单引号需要写成两个
+    QString out = s;
+    out.replace('\'', "''");
+    return out;
+}
+
+static QString writePs1(const QString &scriptBody, const QString &ps1Path)
+{
     QFile f(ps1Path);
-    if (!f.open(QIODevice::WriteOnly)) {
-        debugLog(QString("writePs1 FAILED to open %1").arg(ps1Path));
-        return QString();
-    }
-    f.write("\xEF\xBB\xBF");
+    if (!f.open(QIODevice::WriteOnly)) return QString();
+    f.write("\xEF\xBB\xBF");                    // BOM，避免 PowerShell 按 ANSI 解读中文
     f.write(scriptBody.toUtf8());
     f.close();
-    debugLog(QString("writePs1 OK -> %1 (%2 bytes)").arg(ps1Path).arg(f.size()));
-
-    QFile check(ps1Path);
-    if (check.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QTextStream ts(&check);
-        ts.setEncoding(QStringConverter::Utf8);
-        QString content = ts.readAll();
-        check.close();
-        debugLog(QString("ps1 content:\n%1").arg(content));
-    }
     return ps1Path;
 }
 
-static int runPs1(const QString &ps1Path)
+// ---------------------------------------------------------------- 脚本模板
+
+static QString buildWordReadScript(const QString &srcPath, const QString &outPath)
 {
-    debugLog(QString("runPs1 START: %1").arg(ps1Path));
-    QProcess proc;
-    proc.start("powershell.exe", {
-        "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-File", ps1Path
-    });
-    proc.waitForFinished(45000);
-    int code = proc.exitCode();
-    QByteArray out = proc.readAllStandardOutput();
-    QByteArray err = proc.readAllStandardError();
-
-    debugLog(QString("runPs1 DONE: exitCode=%1, stdout=%2, stderr=%3, procErr=%4")
-        .arg(code).arg(QString::fromUtf8(out)).arg(QString::fromUtf8(err)).arg(proc.errorString()));
-    return code;
-}
-
-static QString readDocxViaWord(const QString &path)
-{
-    debugLog(QString("readDocxViaWord CALLED: %1").arg(path));
-    QString tmpOut = QDir::tempPath() + "/mmplayer_word_read.txt";
-    QString nativePath = QDir::toNativeSeparators(path);
-    QString nativeOut  = QDir::toNativeSeparators(tmpOut);
-
-    QString scriptBody = QStringLiteral(
+    return QStringLiteral(
         "$word = $null; $doc = $null\n"
         "foreach ($name in @('Word.Application','Kwps.Application')) {\n"
         "  try { $word = New-Object -ComObject $name; break } catch { $word = $null }\n"
@@ -102,44 +65,22 @@ static QString readDocxViaWord(const QString &path)
         "  $word.DisplayAlerts = 0\n"
         "  $doc = $word.Documents.Open('%1', $false, $true)\n"
         "  $text = $doc.Content.Text\n"
-        "} catch {\n"
-        "  Write-Host \"OPEN_ERROR: $($_.Exception.Message)\"\n"
-        "}\n"
+        "} catch { Write-Host \"OPEN_ERROR: $($_.Exception.Message)\" }\n"
         "if ($text) {\n"
         "  [System.IO.File]::WriteAllText('%2', $text, [System.Text.Encoding]::UTF8)\n"
         "  Write-Host 'WRITE_OK'\n"
-        "} else {\n"
-        "  Write-Host 'NO_TEXT'\n"
-        "}\n"
+        "} else { Write-Host 'NO_TEXT' }\n"
         "try { if ($doc) { $doc.Close($false) } } catch {}\n"
         "try { if ($word) { $word.Quit() } } catch {}\n"
         "try { if ($word) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null } } catch {}\n"
         "exit 0\n"
-    ).arg(nativePath, nativeOut);
-
-    QString ps1 = writePs1(scriptBody);
-    if (ps1.isEmpty()) return QString();
-    runPs1(ps1);
-    QFile::remove(ps1);
-
-    QFile f(tmpOut);
-    if (!f.exists()) return QString();
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
-    QTextStream ts(&f);
-    ts.setEncoding(QStringConverter::Utf8);
-    QString content = ts.readAll();
-    f.close();
-    QFile::remove(tmpOut);
-    return content;
+    ).arg(psQuote(QDir::toNativeSeparators(srcPath)),
+          psQuote(QDir::toNativeSeparators(outPath)));
 }
 
-static QString readPptxViaPowerPoint(const QString &path)
+static QString buildPptReadScript(const QString &srcPath, const QString &outPath)
 {
-    QString tmpOut = QDir::tempPath() + "/mmplayer_ppt_read.txt";
-    QString nativePath = QDir::toNativeSeparators(path);
-    QString nativeOut  = QDir::toNativeSeparators(tmpOut);
-
-    QString scriptBody = QStringLiteral(
+    return QStringLiteral(
         "$ppt = $null; $pres = $null\n"
         "foreach ($name in @('PowerPoint.Application','Kwpp.Application')) {\n"
         "  try { $ppt = New-Object -ComObject $name; break } catch { $ppt = $null }\n"
@@ -163,59 +104,23 @@ static QString readPptxViaPowerPoint(const QString &path)
         "    [void]$sb.AppendLine()\n"
         "    $idx++\n"
         "  }\n"
-        "} catch {\n"
-        "  Write-Host \"OPEN_ERROR: $($_.Exception.Message)\"\n"
-        "}\n"
+        "} catch { Write-Host \"OPEN_ERROR: $($_.Exception.Message)\" }\n"
         "$text = $sb.ToString()\n"
         "if ($text) {\n"
         "  [System.IO.File]::WriteAllText('%2', $text, [System.Text.Encoding]::UTF8)\n"
         "  Write-Host 'WRITE_OK'\n"
-        "} else {\n"
-        "  Write-Host 'NO_TEXT'\n"
-        "}\n"
+        "} else { Write-Host 'NO_TEXT' }\n"
         "try { if ($pres) { $pres.Close() } } catch {}\n"
         "try { if ($ppt) { $ppt.Quit() } } catch {}\n"
         "try { if ($ppt) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ppt) | Out-Null } } catch {}\n"
         "exit 0\n"
-    ).arg(nativePath, nativeOut);
-
-    QString ps1 = writePs1(scriptBody);
-    if (ps1.isEmpty()) return QString();
-    runPs1(ps1);
-    QFile::remove(ps1);
-
-    QFile f(tmpOut);
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
-    QTextStream ts(&f);
-    ts.setEncoding(QStringConverter::Utf8);
-    QString content = ts.readAll();
-    f.close();
-    QFile::remove(tmpOut);
-    return content;
+    ).arg(psQuote(QDir::toNativeSeparators(srcPath)),
+          psQuote(QDir::toNativeSeparators(outPath)));
 }
 
-static bool saveDocxViaWord(const QString &path, const QString &text)
+static QString buildWordSaveScript(const QString &dstPath, const QString &inPath, int fmt)
 {
-    QString tmpIn = QDir::tempPath() + "/mmplayer_word_write.txt";
-    QString nativePath = QDir::toNativeSeparators(path);
-    QString nativeIn   = QDir::toNativeSeparators(tmpIn);
-
-    {
-        QFile f(tmpIn);
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
-        QTextStream ts(&f);
-        ts.setEncoding(QStringConverter::Utf8);
-        ts << text;
-        f.close();
-    }
-
-    QString lower = path.toLower();
-    int fmt = 16;
-    if (lower.endsWith(".docx")) fmt = 16;
-    else if (lower.endsWith(".doc")) fmt = 0;
-    else if (lower.endsWith(".rtf")) fmt = 6;
-
-    QString scriptBody = QStringLiteral(
+    return QStringLiteral(
         "$word = $null; $doc = $null\n"
         "foreach ($name in @('Word.Application','Kwps.Application')) {\n"
         "  try { $word = New-Object -ComObject $name; break } catch { $word = $null }\n"
@@ -231,22 +136,63 @@ static bool saveDocxViaWord(const QString &path, const QString &text)
         "  $doc.SaveAs2('%2', %3)\n"
         "  $ok = $true\n"
         "  Write-Host 'SAVE_OK'\n"
-        "} catch {\n"
-        "  Write-Host \"SAVE_ERROR: $($_.Exception.Message)\"\n"
-        "}\n"
+        "} catch { Write-Host \"SAVE_ERROR: $($_.Exception.Message)\" }\n"
         "try { if ($doc) { $doc.Close($false) } } catch {}\n"
         "try { if ($word) { $word.Quit() } } catch {}\n"
         "try { if ($word) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null } } catch {}\n"
         "if ($ok) { exit 0 } else { exit 1 }\n"
-    ).arg(nativeIn, nativePath).arg(fmt);
-
-    QString ps1 = writePs1(scriptBody);
-    if (ps1.isEmpty()) { QFile::remove(tmpIn); return false; }
-    int code = runPs1(ps1);
-    QFile::remove(ps1);
-    QFile::remove(tmpIn);
-    return code == 0;
+    ).arg(psQuote(QDir::toNativeSeparators(inPath)),
+          psQuote(QDir::toNativeSeparators(dstPath)))
+     .arg(fmt);
 }
+
+// Word 保存仍为同步调用（用户主动触发、通常 1~2 秒），但不再无脑等 45 秒
+static bool runPs1Sync(const QString &ps1Path, int timeoutMs = 20000)
+{
+    QProcess proc;
+    proc.start("powershell.exe", {
+        "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File", ps1Path
+    });
+    if (!proc.waitForStarted(timeoutMs)) return false;
+    if (!proc.waitForFinished(timeoutMs)) {
+        proc.kill();
+        proc.waitForFinished(1000);
+        return false;
+    }
+    return proc.exitCode() == 0;
+}
+
+static bool saveDocxViaWord(const QString &path, const QString &text)
+{
+    const QString tmpIn  = QDir::tempPath() + "/mmplayer_write_" + QUuid::createUuid().toString(QUuid::Id128) + ".txt";
+    const QString ps1    = QDir::tempPath() + "/mmplayer_save_"  + QUuid::createUuid().toString(QUuid::Id128) + ".ps1";
+
+    {
+        QFile f(tmpIn);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
+        QTextStream ts(&f);
+        ts.setEncoding(QStringConverter::Utf8);
+        ts << text;
+        f.close();
+    }
+
+    const QString lower = path.toLower();
+    int fmt = 16;                              // wdFormatDocumentDefault (docx)
+    if (lower.endsWith(".doc"))      fmt = 0;  // wdFormatDocument
+    else if (lower.endsWith(".rtf")) fmt = 6;  // wdFormatRTF
+
+    bool ok = false;
+    if (!writePs1(buildWordSaveScript(path, tmpIn, fmt), ps1).isEmpty()) {
+        ok = runPs1Sync(ps1);
+        QFile::remove(ps1);
+    }
+    QFile::remove(tmpIn);
+    return ok;
+}
+
+// ---------------------------------------------------------------- TextPanel
 
 TextPanel::TextPanel(const QString &path, QWidget *parent)
     : MediaPanel(Text, path, parent), m_currentPath(path)
@@ -257,49 +203,8 @@ TextPanel::TextPanel(const QString &path, QWidget *parent)
     lay->setContentsMargins(0, 0, 0, 0);
     lay->addWidget(m_textEdit);
 
-    QString content;
-    if (isWordFormat(path)) {
-        m_infoLabel->setText(QString::fromUtf8("正在通过 Word 加载..."));
-        QCoreApplication::processEvents();
-        content = readDocxViaWord(path);
-        if (content.isEmpty()) {
-            content = QString::fromUtf8("(无法读取此 Word 文件，请确保已安装 Microsoft Word 或 WPS)");
-        }
-    } else if (isPptFormat(path)) {
-        m_infoLabel->setText(QString::fromUtf8("正在通过 PowerPoint 加载..."));
-        QCoreApplication::processEvents();
-        content = readPptxViaPowerPoint(path);
-        if (content.isEmpty()) {
-            content = QString::fromUtf8("(无法读取此 PPT 文件，请确保已安装 PowerPoint 或 WPS 演示)");
-        }
-    } else {
-        QFile file(path);
-        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QTextStream stream(&file);
-            stream.setEncoding(QStringConverter::Utf8);
-            content = stream.readAll();
-            file.close();
-            if (content.isEmpty()) {
-                file.open(QIODevice::ReadOnly);
-                content = QString::fromLocal8Bit(file.readAll());
-                file.close();
-            }
-        }
-    }
-
-    m_blockTextSignal = true;
-    m_textEdit->setPlainText(content);
-    m_blockTextSignal = false;
-
-    int lines = content.isEmpty() ? 0 : content.count('\n') + 1;
-    int chars = content.size();
-    if (lines == 1 && content.isEmpty()) {
-        m_infoLabel->setText(QString::fromUtf8("新文件"));
-    } else {
-        m_infoLabel->setText(QString("%1 %2 \xc2\xb7 %3 %4")
-            .arg(lines).arg(QString::fromUtf8("行"))
-            .arg(chars).arg(QString::fromUtf8("字符")));
-    }
+    // 文本面板没有播放/进度/音量概念，底部控制栏整条移除以腾出编辑区
+    removeControlBar();
 
     connect(m_textEdit, &QPlainTextEdit::textChanged, this, &TextPanel::onTextChanged);
 
@@ -314,14 +219,9 @@ TextPanel::TextPanel(const QString &path, QWidget *parent)
     saveAsShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(saveAsShortcut, &QShortcut::activated, this, &TextPanel::onSaveAs);
 
-    m_playBtn->hide();
-    m_stopBtn->hide();
-    m_progress->hide();
-    m_timeLabel->hide();
-    m_volume->hide();
-
-    auto *topBar = m_titleLabel->parentWidget();
-    auto *topLay = qobject_cast<QHBoxLayout*>(topBar->layout());
+    // 主题按钮插入到放大按钮左边
+    QWidget *topBar = m_titleLabel ? m_titleLabel->parentWidget() : nullptr;
+    auto *topLay = topBar ? qobject_cast<QHBoxLayout*>(topBar->layout()) : nullptr;
     int idx = topLay ? topLay->indexOf(m_amplifyBtn) : -1;
 
     m_themeBtn = new QPushButton("\xe2\x98\x91", topBar);
@@ -334,9 +234,169 @@ TextPanel::TextPanel(const QString &path, QWidget *parent)
     if (topLay && idx >= 0) topLay->insertWidget(idx, m_themeBtn);
 
     applyTheme(true);
-    connect(m_themeBtn, &QPushButton::clicked, this, [this]() {
-        applyTheme(!m_darkMode);
+    connect(m_themeBtn, &QPushButton::clicked, this, [this]() { applyTheme(!m_darkMode); });
+
+    // 界面先画出来，再异步读内容，避免打开 docx 时整个窗口卡死
+    startLoad();
+}
+
+TextPanel::~TextPanel()
+{
+    if (m_proc) {
+        disconnect(m_proc, nullptr, this, nullptr);
+        if (m_proc->state() != QProcess::NotRunning) {
+            m_proc->kill();
+            m_proc->waitForFinished(800);
+        }
+    }
+    cleanupTempFiles();
+}
+
+void TextPanel::cleanupTempFiles()
+{
+    if (!m_tmpOut.isEmpty()) { QFile::remove(m_tmpOut); m_tmpOut.clear(); }
+    if (!m_tmpPs1.isEmpty()) { QFile::remove(m_tmpPs1); m_tmpPs1.clear(); }
+}
+
+void TextPanel::startLoad()
+{
+    if (isWordFormat(m_currentPath)) {
+        startOfficeExtract(false);
+    } else if (isPptFormat(m_currentPath)) {
+        startOfficeExtract(true);
+    } else {
+        loadPlainText();
+    }
+}
+
+void TextPanel::loadPlainText()
+{
+    QFile file(m_currentPath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        applyContent(QString::fromUtf8("(无法打开文件: %1)").arg(m_currentPath));
+        m_infoLabel->setText(QString::fromUtf8("打开失败"));
+        return;
+    }
+
+    const qint64 total = file.size();
+    if (total > kHugeFileBytes) {
+        file.close();
+        applyContent(QString::fromUtf8("(文件过大，%1 MB，已跳过加载)").arg(total / 1024 / 1024));
+        m_infoLabel->setText(QString::fromUtf8("文件过大"));
+        return;
+    }
+
+    const QByteArray raw = file.readAll();
+    file.close();
+
+    // 先按 UTF-8 严格解码，失败再退回本地编码（中文 Windows 即 GBK）
+    QStringDecoder utf8(QStringDecoder::Utf8);
+    QString content = utf8(raw);
+    if (utf8.hasError()) {
+        QStringDecoder local(QStringDecoder::System);
+        content = local(raw);
+    }
+
+    applyContent(content);
+    if (total > kBigFileWarnBytes)
+        m_infoLabel->setText(m_infoLabel->text() + QString::fromUtf8(" · 大文件"));
+}
+
+void TextPanel::startOfficeExtract(bool ppt)
+{
+    const QString tag = QUuid::createUuid().toString(QUuid::Id128);
+    m_tmpOut = QDir::tempPath() + "/mmplayer_read_" + tag + ".txt";
+    m_tmpPs1 = QDir::tempPath() + "/mmplayer_read_" + tag + ".ps1";
+
+    const QString script = ppt ? buildPptReadScript(m_currentPath, m_tmpOut)
+                               : buildWordReadScript(m_currentPath, m_tmpOut);
+    if (writePs1(script, m_tmpPs1).isEmpty()) {
+        applyContent(QString::fromUtf8("(无法创建临时脚本)"));
+        cleanupTempFiles();
+        return;
+    }
+
+    m_officeLoad = true;
+    m_infoLabel->setText(ppt ? QString::fromUtf8("正在提取 PPT 文本...")
+                             : QString::fromUtf8("正在提取 Word 文本..."));
+    m_textEdit->setReadOnly(true);
+    m_textEdit->setPlaceholderText(QString::fromUtf8("正在读取，请稍候…"));
+
+    m_proc = new QProcess(this);
+    connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &TextPanel::onExtractFinished);
+    connect(m_proc, &QProcess::errorOccurred, this, &TextPanel::onExtractError);
+    m_proc->start("powershell.exe", {
+        "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File", m_tmpPs1
     });
+
+    // 60 秒兜底，避免 Word 弹窗等异常把进程挂死
+    QTimer::singleShot(60000, this, [this]() {
+        if (m_proc && m_proc->state() != QProcess::NotRunning) {
+            m_proc->kill();
+            if (m_officeLoad) {
+                m_officeLoad = false;
+                m_textEdit->setReadOnly(false);
+                applyContent(QString::fromUtf8("(读取超时，请确认已安装 Word/WPS 且文件未被占用)"));
+            }
+        }
+    });
+}
+
+void TextPanel::onExtractError(int error)
+{
+    if (!m_officeLoad) return;
+    m_officeLoad = false;
+    m_textEdit->setReadOnly(false);
+    Q_UNUSED(error);
+    applyContent(QString::fromUtf8("(无法启动 PowerShell，提取失败)"));
+    cleanupTempFiles();
+}
+
+void TextPanel::onExtractFinished(int exitCode, int exitStatus)
+{
+    Q_UNUSED(exitStatus);
+    if (!m_officeLoad) return;
+    m_officeLoad = false;
+    m_textEdit->setReadOnly(false);
+    m_textEdit->setPlaceholderText(QString());
+
+    QString content;
+    QFile f(m_tmpOut);
+    if (f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream ts(&f);
+        ts.setEncoding(QStringConverter::Utf8);
+        content = ts.readAll();
+        f.close();
+    }
+    cleanupTempFiles();
+
+    if (content.isEmpty()) {
+        content = (exitCode == 2)
+            ? QString::fromUtf8("(未检测到 Microsoft Word / WPS，无法提取文档文本)")
+            : QString::fromUtf8("(未能从该文档提取到文本内容)");
+    }
+    applyContent(content);
+}
+
+void TextPanel::applyContent(const QString &content)
+{
+    m_blockTextSignal = true;
+    m_textEdit->setPlainText(content);
+    m_blockTextSignal = false;
+
+    const int lines = content.isEmpty() ? 0 : content.count('\n') + 1;
+    const int chars = content.size();
+    if (content.isEmpty()) {
+        m_infoLabel->setText(QString::fromUtf8("空文件"));
+    } else {
+        m_infoLabel->setText(QString("%1 %2 \xc2\xb7 %3 %4")
+            .arg(lines).arg(QString::fromUtf8("行"))
+            .arg(chars).arg(QString::fromUtf8("字符")));
+    }
+    setDirty(false);
 }
 
 void TextPanel::applyTheme(bool dark)
@@ -352,7 +412,7 @@ void TextPanel::applyTheme(bool dark)
         "color: %2;"
         "selection-background-color: %3;"
         "selection-color: %4;"
-        "font-family: Consolas;"
+        "font-family: Consolas, 'Microsoft YaHei';"
         "font-size: 12px;"
         "border: none;"
         "padding: 8px;"
@@ -366,9 +426,11 @@ void TextPanel::applyTheme(bool dark)
         m_mediaArea->setStyleSheet(QString("background-color: %1;").arg(bg));
     }
 
-    m_themeBtn->setText(dark ? "\xe2\x98\x91" : "\xe2\x98\x9e");
-    m_themeBtn->setToolTip(dark ? QString::fromUtf8("切换为明亮模式")
-                                : QString::fromUtf8("切换为暗黑模式"));
+    if (m_themeBtn) {
+        m_themeBtn->setText(dark ? "\xe2\x98\x91" : "\xe2\x98\x9e");
+        m_themeBtn->setToolTip(dark ? QString::fromUtf8("切换为明亮模式")
+                                    : QString::fromUtf8("切换为暗黑模式"));
+    }
 }
 
 void TextPanel::onTextChanged()
@@ -403,8 +465,9 @@ void TextPanel::saveToFile(const QString &path)
         m_infoLabel->setText(QString::fromUtf8("正在通过 Word 保存..."));
         QCoreApplication::processEvents();
         if (!saveDocxViaWord(path, content)) {
+            m_infoLabel->setText(QString::fromUtf8("保存失败"));
             QMessageBox::warning(this, QString::fromUtf8("保存失败"),
-                QString::fromUtf8("无法通过 Word 保存，请确保已安装 Microsoft Word"));
+                QString::fromUtf8("无法通过 Word 保存，请确保已安装 Microsoft Word 或 WPS。"));
             return;
         }
     } else {
@@ -422,7 +485,7 @@ void TextPanel::saveToFile(const QString &path)
 
     m_currentPath = path;
     setDirty(false);
-    m_infoLabel->setText(QString::fromUtf8("已保存 · ") + QFileInfo(path).fileName());
+    m_infoLabel->setText(QString::fromUtf8("已保存 \xc2\xb7 ") + QFileInfo(path).fileName());
 }
 
 void TextPanel::onSave()
@@ -447,6 +510,11 @@ void TextPanel::onSaveAs()
         path += ".txt";
     }
     saveToFile(path);
+}
+
+void TextPanel::requestClose()
+{
+    onCloseRequested();
 }
 
 void TextPanel::onCloseRequested()

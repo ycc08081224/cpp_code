@@ -5,19 +5,29 @@
 #include <QPainterPath>
 #include <QLinearGradient>
 #include <QRadialGradient>
-#include <QScreen>
-#include <QGuiApplication>
 #include <QFile>
+#include <QDir>
 #include <QTextStream>
 #include <QDateTime>
+#include <QStandardPaths>
 #include <csignal>
 #include "MainWindow.h"
 
-static const char *LOG_FILE = "D:/gongzuo/zuoye/huochairen/cpp_code/build/crash.log";
+// 日志写到用户数据目录，不再硬编码开发机路径（发布版原本会写到一个不存在的盘符）
+static QString logFilePath()
+{
+    static const QString path = []() {
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        if (dir.isEmpty()) dir = QDir::tempPath();
+        QDir().mkpath(dir);
+        return dir + "/player.log";
+    }();
+    return path;
+}
 
 static void crashSignalHandler(int sig)
 {
-    QFile f(LOG_FILE);
+    QFile f(logFilePath());
     if (f.open(QIODevice::Append | QIODevice::Text)) {
         QTextStream ts(&f);
         ts << "\n===== CRASH at " << QDateTime::currentDateTime().toString()
@@ -28,9 +38,10 @@ static void crashSignalHandler(int sig)
     raise(sig);
 }
 
+// 只在设置 MM_DEBUG=1 时启用：每次 qDebug 都开关文件对 UI 线程是实打实的开销
 static void logMsg(QtMsgType type, const QMessageLogContext &, const QString &msg)
 {
-    QFile f(LOG_FILE);
+    QFile f(logFilePath());
     if (f.open(QIODevice::Append | QIODevice::Text)) {
         QTextStream ts(&f);
         ts << QDateTime::currentDateTime().toString("hh:mm:ss.zzz")
@@ -204,8 +215,12 @@ static QIcon buildAppIcon()
 
     p.end();
 
-    // Save PNG for preview
-    pm.save("D:/gongzuo/zuoye/huochairen/cpp_code/build/app_icon.png", "PNG");
+    // 需要预览图标时设置 MM_DEBUG_ICON=1，正常启动不再往构建目录写 PNG
+    if (qEnvironmentVariableIsSet("MM_DEBUG_ICON")) {
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QDir().mkpath(dir);
+        pm.save(dir + "/app_icon.png", "PNG");
+    }
 
     QIcon icon(pm);
     return icon;
@@ -213,34 +228,26 @@ static QIcon buildAppIcon()
 
 int main(int argc, char *argv[])
 {
-    signal(SIGSEGV, crashSignalHandler);
-    signal(SIGABRT, crashSignalHandler);
-    signal(SIGFPE, crashSignalHandler);
-    signal(SIGILL, crashSignalHandler);
-    qInstallMessageHandler(logMsg);
-
     QApplication app(argc, argv);
     app.setOrganizationName("MultiMediaPlayer");
     app.setApplicationName("MultiMediaPlayer");
-    app.setApplicationVersion("1.1.0");
+    app.setApplicationVersion("1.2.1");
     app.setWindowIcon(buildAppIcon());
 
     QApplication::setStyle("Fusion");
 
+    signal(SIGSEGV, crashSignalHandler);
+    signal(SIGABRT, crashSignalHandler);
+    signal(SIGFPE,  crashSignalHandler);
+    signal(SIGILL,  crashSignalHandler);
+    if (qEnvironmentVariableIsSet("MM_DEBUG"))
+        qInstallMessageHandler(logMsg);
+
     MainWindow w;
     w.setWindowIcon(app.windowIcon());
 
-    QScreen *scr = QGuiApplication::primaryScreen();
-    if (scr) {
-        QRect sg = scr->availableGeometry();
-        int ww = int(sg.width() * 0.9);
-        int wh = int(sg.height() * 0.9);
-        w.resize(ww, wh);
-        w.move(sg.center().x() - ww / 2, sg.center().y() - wh / 2);
-    } else {
-        w.resize(1200, 800);
-    }
-
+    // 窗口几何由 MainWindow::loadSettings() 恢复，这里不能再 resize/move，
+    // 否则每次启动都会把用户调整过的位置和大小覆盖掉
     w.show();
 
     QStringList args = app.arguments();

@@ -29,6 +29,7 @@ private slots:
     void onLastPage();
     void onZoomIn();
     void onZoomOut();
+    void onToggleFit();
     void updatePageLabel(int page);
 
 private:
@@ -42,6 +43,7 @@ private:
     QPushButton *m_lastPageBtn = nullptr;
     QPushButton *m_zoomInBtn = nullptr;
     QPushButton *m_zoomOutBtn = nullptr;
+    QPushButton *m_fitBtn = nullptr;
     QLabel *m_pageLabel = nullptr;
     QLabel *m_placeholderLabel = nullptr;
     int m_pageCount = 0;

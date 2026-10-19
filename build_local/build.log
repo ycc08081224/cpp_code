@@ -1,0 +1,6 @@
+[  0%] Built target MultiMediaPlayer_autogen_timestamp_deps
+[  9%] Automatic MOC and UIC for target MultiMediaPlayer
+[  9%] Built target MultiMediaPlayer_autogen
+[ 18%] Building CXX object CMakeFiles/MultiMediaPlayer.dir/src/MediaPanel.cpp.obj
+[ 27%] Linking CXX executable MultiMediaPlayer.exe
+[100%] Built target MultiMediaPlayer

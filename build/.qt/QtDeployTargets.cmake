@@ -1,3 +1,0 @@
-set(__QT_DEPLOY_TARGET_MultiMediaPlayer_FILE D:/gongzuo/zuoye/huochairen/cpp_code/build/MultiMediaPlayer.exe)
-set(__QT_DEPLOY_TARGET_MultiMediaPlayer_TYPE EXECUTABLE)
-set(__QT_DEPLOY_TARGET_MultiMediaPlayer_RUNTIME_DLLS D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6MultimediaWidgets.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6PdfWidgets.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Multimedia.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Network.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Pdf.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Widgets.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Gui.dll;D:/gongzuo/zuoye/huochairen/6.7.3/mingw_64/bin/Qt6Core.dll)
